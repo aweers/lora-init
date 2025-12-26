@@ -4,6 +4,8 @@ Test different LoRA initialization strategies on a small LLM using Unsloth.
 Compares:
 1. Standard init: A randomly initialized (Kaiming), B = 0
 2. Reversed init: A = 0, B randomly initialized (Kaiming)
+3. Orthogonal QR init: A and B initialized using QR decomposition orthogonal matrix
+4. Orthogonal Eye init: A and B initialized using identity matrix orthogonal basis
 
 Logs metrics to Weights & Biases.
 """
@@ -129,7 +131,7 @@ def get_args():
         "--init_strategy",
         type=str,
         default="both",
-        choices=["standard", "reversed", "both"],
+        choices=["standard", "reversed", "orthogonal_qr", "orthogonal_eye", "both"],
         help="Which initialization strategy to test",
     )
     return parser.parse_args()
@@ -143,7 +145,7 @@ def set_seed(seed: int):
 
 def reinitialize_lora_weights(
     model: nn.Module,
-    init_type: Literal["standard", "reversed"],
+    init_type: Literal["standard", "reversed", "orthogonal_qr", "orthogonal_eye"],
     lora_alpha: int,
     lora_r: int,
 ):
@@ -155,7 +157,11 @@ def reinitialize_lora_weights(
 
     Args:
         model: The PEFT model
-        init_type: 'standard' (A=random, B=0) or 'reversed' (A=0, B=random)
+        init_type: Initialization strategy:
+            - 'standard': A=random (Kaiming), B=0
+            - 'reversed': A=0, B=random (Kaiming)
+            - 'orthogonal_qr': Orthogonal init using QR decomposition
+            - 'orthogonal_eye': Orthogonal init using identity matrix
         lora_alpha: LoRA alpha for scaling
         lora_r: LoRA rank
     """
@@ -171,6 +177,57 @@ def reinitialize_lora_weights(
                 elif init_type == "reversed":
                     nn.init.zeros_(lora_A.weight)
                     nn.init.kaiming_uniform_(lora_B.weight, a=math.sqrt(5))
+                elif init_type == "orthogonal_qr":
+                    r = lora_A.weight.shape[0]
+                    in_features = lora_A.weight.shape[1]
+                    out_features = lora_B.weight.shape[0]
+
+                    with torch.no_grad():
+                        # QR decomposition of a random matrix
+                        X = torch.randn(r, r)
+                        Q, _ = torch.linalg.qr(X)
+
+                        # Split into two sets (alternating rows)
+                        set1 = Q[0::2, :]  # Rows at indices 0, 2, 4, ...
+                        set2 = Q[1::2, :]  # Rows at indices 1, 3, 5, ...
+
+                        # Compute Kaiming-style scaling for variance matching
+                        # For Kaiming uniform with a=sqrt(5), variance ≈ 1/fan_in
+                        a_scale = math.sqrt(1.0 / in_features)
+                        b_scale = math.sqrt(1.0 / r)
+
+                        # Initialize A and B following the orthogonal pattern
+                        a_wt = torch.randn(in_features, r//2).mm(set1).T * a_scale
+                        b_wt = torch.randn(r//2, out_features).T.mm(set2) * b_scale
+
+                        # Copy to weights with proper dtype
+                        lora_A.weight.copy_(a_wt.to(lora_A.weight.dtype))
+                        lora_B.weight.copy_(b_wt.to(lora_B.weight.dtype))
+                elif init_type == "orthogonal_eye":
+                    r = lora_A.weight.shape[0]
+                    in_features = lora_A.weight.shape[1]
+                    out_features = lora_B.weight.shape[0]
+
+                    with torch.no_grad():
+                        # Use identity matrix
+                        Q = torch.eye(r, r)
+
+                        # Split into two sets (alternating rows)
+                        set1 = Q[0::2, :]  # Rows at indices 0, 2, 4, ...
+                        set2 = Q[1::2, :]  # Rows at indices 1, 3, 5, ...
+
+                        # Compute Kaiming-style scaling for variance matching
+                        # For Kaiming uniform with a=sqrt(5), variance ≈ 1/fan_in
+                        a_scale = math.sqrt(1.0 / in_features)
+                        b_scale = math.sqrt(1.0 / r)
+
+                        # Initialize A and B following the orthogonal pattern
+                        a_wt = torch.randn(in_features, r//2).mm(set1).T * a_scale
+                        b_wt = torch.randn(r//2, out_features).T.mm(set2) * b_scale
+
+                        # Copy to weights with proper dtype
+                        lora_A.weight.copy_(a_wt.to(lora_A.weight.dtype))
+                        lora_B.weight.copy_(b_wt.to(lora_B.weight.dtype))
 
                 module.scaling[adapter_name] = lora_alpha / lora_r
 
@@ -661,7 +718,7 @@ def main():
     results: dict[str, list[RunMetrics]] = {}
     aggregate_stats: dict[str, dict] = {}
 
-    for init_type in ["standard", "reversed"]:
+    for init_type in ["standard", "reversed", "orthogonal_qr", "orthogonal_eye"]:
         if args.init_strategy not in [init_type, "both"]:
             continue
 
